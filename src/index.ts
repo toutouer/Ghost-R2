@@ -1,21 +1,16 @@
+import BaseAdapter, { Image, ReadOptions } from 'ghost-storage-base'
 import {
-  type PutObjectCommandInput,
-  type S3ClientConfig,
-  type ObjectCannedACL,
-  S3,
+  DeleteObjectCommand,
+  GetObjectCommand,
+  GetObjectCommandInput,
+  HeadObjectCommand,
+  PutObjectCommand,
+  S3Client,
 } from '@aws-sdk/client-s3'
-import StorageBase, { type ReadOptions, type Image } from 'ghost-storage-base'
-import errors from '@tryghost/errors'
-import tpl from '@tryghost/tpl'
-import { join } from 'path'
 import { createReadStream } from 'fs'
-import type { Readable } from 'stream'
+import { extname, posix } from 'path'
 import type { Handler } from 'express'
-
-const stripLeadingSlash = (s: string) =>
-  s.indexOf('/') === 0 ? s.substring(1) : s
-const stripEndingSlash = (s: string) =>
-  s.indexOf('/') === s.length - 1 ? s.substring(0, s.length - 1) : s
+import type { Readable } from 'stream'
 
 type Config = {
   accessKeyId?: string
@@ -26,224 +21,239 @@ type Config = {
   secretAccessKey?: string
   endpoint?: string
   forcePathStyle?: boolean
-  useDualstackEndpoint?: boolean
-  acl?: string
+  serveMode?: 'direct' | 'redirect'
 }
 
-class S3Storage extends StorageBase {
-  accessKeyId?: string
-  secretAccessKey?: string
-  region?: string
-  bucket?: string
-  host: string
-  pathPrefix: string
-  endpoint: string
-  forcePathStyle: boolean
-  useDualstackEndpoint: boolean
-  acl?: ObjectCannedACL
+const MIME_MAP: Record<string, string> = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.svg': 'image/svg+xml',
+  '.avif': 'image/avif',
+  '.ico': 'image/x-icon',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.ogv': 'video/ogg',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.ogg': 'audio/ogg',
+  '.m4a': 'audio/mp4',
+  '.pdf': 'application/pdf',
+  '.zip': 'application/zip',
+  '.json': 'application/json',
+  '.webmanifest': 'application/manifest+json',
+}
 
-  constructor(config: Config = {}) {
+function getContentType(filePath?: string, explicitType?: string): string {
+  if (explicitType) return explicitType
+  if (filePath && filePath.includes('/format/webp/')) return 'image/webp'
+  if (filePath && filePath.includes('/format/avif/')) return 'image/avif'
+  const ext = extname(filePath || '').toLowerCase()
+  return MIME_MAP[ext] || 'application/octet-stream'
+}
+
+const stripLeadingAndTrailingSlashes = (str: string) =>
+  str.replace(/^\/+|\/+$/g, '')
+const stripEndingSlash = (str: string) => str.replace(/\/+$/, '')
+
+function isNotFoundError(err: any): boolean {
+  if (!err) return false
+  return Boolean(
+    err.name === 'NoSuchKey' ||
+      err.name === 'NotFound' ||
+      err.Code === 'NoSuchKey' ||
+      (err.$metadata && err.$metadata.httpStatusCode === 404)
+  )
+}
+
+export default class S3Storage extends BaseAdapter {
+  private client: S3Client
+  private bucket: string
+  private host: string
+  private serveMode: 'direct' | 'redirect'
+
+  constructor(config: Config) {
     super()
+    this.client = new S3Client({
+      region: config.region || 'auto',
+      credentials:
+        config.accessKeyId && config.secretAccessKey
+          ? {
+              accessKeyId: config.accessKeyId,
+              secretAccessKey: config.secretAccessKey,
+            }
+          : undefined,
+      endpoint: config.endpoint,
+      forcePathStyle: config.forcePathStyle ?? Boolean(config.endpoint),
+    })
+    if (!config.bucket) throw new Error('S3 bucket not specified')
+    this.bucket = config.bucket
+    this.pathPrefix = stripLeadingAndTrailingSlashes(config.pathPrefix || '')
+    const defaultHost = `https://s3.${config.region ? `${config.region}.` : ''}amazonaws.com/${config.bucket}`
+    this.host = stripEndingSlash(config.assetHost || defaultHost)
+    this.serveMode = config.serveMode || 'direct'
+  }
 
-    const {
-      accessKeyId,
-      assetHost,
-      bucket,
-      pathPrefix,
-      region,
-      secretAccessKey,
-      endpoint,
-      forcePathStyle,
-      useDualstackEndpoint,
-      acl,
-    } = config
-
-    // Compatible with the aws-sdk's default environment variables
-    this.accessKeyId = accessKeyId
-    this.secretAccessKey = secretAccessKey
-    this.region = process.env.AWS_DEFAULT_REGION || region
-
-    this.bucket = process.env.GHOST_STORAGE_ADAPTER_S3_PATH_BUCKET || bucket
-
-    if (!this.bucket) throw new Error('S3 bucket not specified')
-
-    // Optional configurations
-    this.forcePathStyle =
-      Boolean(process.env.GHOST_STORAGE_ADAPTER_S3_FORCE_PATH_STYLE) ||
-      Boolean(forcePathStyle) ||
-      false
-
-    this.useDualstackEndpoint =
-      Boolean(process.env.GHOST_STORAGE_ADAPTER_S3_USE_DUALSTACK_ENDPOINT) ||
-      Boolean(useDualstackEndpoint) ||
-      false
-
-    let defaultHost: string
-
-    if (this.forcePathStyle) {
-      defaultHost = `https://s3${
-        this.region === 'us-east-1' ? '' : `.${this.region}`
-      }.amazonaws.com/${this.bucket}`
-    } else {
-      defaultHost = `https://${this.bucket}.s3${
-        this.region === 'us-east-1' ? '' : `.${this.region}`
-      }.amazonaws.com`
+  urlToPath(url: string): string {
+    if (url && url.startsWith(this.host)) {
+      return url.substring(this.host.length)
     }
+    try {
+      return new URL(url).pathname
+    } catch {
+      return url
+    }
+  }
 
-    this.host =
-      process.env.GHOST_STORAGE_ADAPTER_S3_ASSET_HOST ||
-      assetHost ||
-      defaultHost
+  resolveKey(fileName?: string, targetDir?: string): string {
+    const joined = targetDir
+      ? posix.join(targetDir, fileName || '')
+      : fileName || ''
+    const cleaned = stripLeadingAndTrailingSlashes(joined)
+    if (!this.pathPrefix) return cleaned
+    if (
+      cleaned === this.pathPrefix ||
+      cleaned.startsWith(this.pathPrefix + '/')
+    ) {
+      return cleaned
+    }
+    return stripLeadingAndTrailingSlashes(posix.join(this.pathPrefix, cleaned))
+  }
 
-    this.pathPrefix = stripLeadingSlash(
-      process.env.GHOST_STORAGE_ADAPTER_S3_PATH_PREFIX || pathPrefix || ''
+  async delete(fileName: string, targetDir?: string): Promise<boolean> {
+    const target = this.resolveKey(
+      fileName,
+      targetDir || this.getTargetDir(this.pathPrefix)
     )
-    this.endpoint =
-      process.env.GHOST_STORAGE_ADAPTER_S3_ENDPOINT || endpoint || ''
-    this.acl = (process.env.GHOST_STORAGE_ADAPTER_S3_ACL ||
-      acl ||
-      'public-read') as ObjectCannedACL
-  }
-
-  async delete(fileName: string, targetDir?: string) {
-    const directory = targetDir || this.getTargetDir(this.pathPrefix)
-
     try {
-      await this.s3().deleteObject({
-        Bucket: this.bucket,
-        Key: stripLeadingSlash(join(directory, fileName)),
-      })
+      await this.client.send(
+        new DeleteObjectCommand({
+          Bucket: this.bucket,
+          Key: target,
+        })
+      )
     } catch {
       return false
     }
     return true
   }
 
-  async exists(fileName: string, targetDir?: string) {
+  async exists(fileName: string, targetDir?: string): Promise<boolean> {
+    const key = this.resolveKey(fileName, targetDir)
     try {
-      await this.s3().getObject({
-        Bucket: this.bucket,
-        Key: stripLeadingSlash(
-          targetDir ? join(targetDir, fileName) : fileName
-        ),
-      })
+      await this.client.send(
+        new HeadObjectCommand({
+          Bucket: this.bucket,
+          Key: key,
+        })
+      )
     } catch {
       return false
     }
     return true
   }
 
-  s3() {
-    const options: S3ClientConfig = {
-      region: this.region,
-      forcePathStyle: this.forcePathStyle,
-      useDualstackEndpoint: this.useDualstackEndpoint,
-    }
-
-    // Set credentials only if provided, falls back to AWS SDK's default provider chain
-    if (this.accessKeyId && this.secretAccessKey) {
-      options.credentials = {
-        accessKeyId: this.accessKeyId,
-        secretAccessKey: this.secretAccessKey,
-      }
-    }
-
-    if (this.endpoint !== '') {
-      options.endpoint = this.endpoint
-    }
-    return new S3(options)
-  }
-
-  // Doesn't seem to be documented, but required for using this adapter for other media file types.
-  // Seealso: https://github.com/laosb/ghos3/pull/6
-  urlToPath(url: string) {
-    const parsedUrl = new URL(url)
-    return parsedUrl.pathname
-  }
-
-  async save(image: Image, targetDir?: string) {
-    const directory = targetDir || this.getTargetDir(this.pathPrefix)
-
-    const fileName = await this.getUniqueFileName(image, directory)
+  async save(image: Image, targetDir?: string): Promise<string> {
+    const dir = targetDir || this.getTargetDir(this.pathPrefix)
+    const targetRelative = await this.getUniqueFileName(image, dir)
+    const key = this.resolveKey(targetRelative)
     const file = createReadStream(image.path)
+    await this.client.send(
+      new PutObjectCommand({
+        Bucket: this.bucket,
+        Key: key,
+        Body: file,
+        ContentType: getContentType(image.name || image.path, image.type),
+        CacheControl: 'public, max-age=31536000, immutable',
+      })
+    )
+    return `${this.host}/${key}`
+  }
 
-    let config: PutObjectCommandInput = {
-      ACL: this.acl,
-      Body: file,
-      Bucket: this.bucket,
-      CacheControl: `max-age=${30 * 24 * 60 * 60}`,
-      ContentType: image.type,
-      Key: stripLeadingSlash(fileName),
-    }
-    await this.s3().putObject(config)
-
-    return `${this.host}/${stripLeadingSlash(fileName)}`
+  async saveRaw(buffer: Buffer, targetPath: string): Promise<string> {
+    const key = this.resolveKey(targetPath)
+    await this.client.send(
+      new PutObjectCommand({
+        Bucket: this.bucket,
+        Key: key,
+        Body: buffer,
+        ContentType: getContentType(targetPath),
+        CacheControl: 'public, max-age=31536000, immutable',
+      })
+    )
+    return `${this.host}/${key}`
   }
 
   serve(): Handler {
     return async (req, res, next) => {
+      const key = this.resolveKey(decodeURIComponent(req.path))
+      if (this.serveMode === 'redirect') {
+        res.redirect(301, `${this.host}/${key}`)
+        return
+      }
       try {
-        const output = await this.s3().getObject({
+        const params: GetObjectCommandInput = {
           Bucket: this.bucket,
-          Key: stripLeadingSlash(stripEndingSlash(this.pathPrefix) + req.path),
-        })
-
-        const headers: { [key: string]: string } = {}
-        if (output.AcceptRanges) headers['accept-ranges'] = output.AcceptRanges
-        if (output.CacheControl) headers['cache-control'] = output.CacheControl
-        if (output.ContentDisposition)
-          headers['content-disposition'] = output.ContentDisposition
-        if (output.ContentEncoding)
-          headers['content-encoding'] = output.ContentEncoding
-        if (output.ContentLanguage)
-          headers['content-language'] = output.ContentLanguage
-        if (output.ContentLength)
-          headers['content-length'] = `${output.ContentLength}`
-        if (output.ContentRange) headers['content-range'] = output.ContentRange
-        if (output.ContentType) headers['content-type'] = output.ContentType
-        if (output.ETag) headers['etag'] = output.ETag
-        res.set(headers)
-
-        const stream = output.Body as Readable
-        stream.pipe(res)
-      } catch (err) {
-        if (err.name === 'NoSuchKey') {
-          return next(
-            new errors.NotFoundError({
-              message: tpl('File not found'),
-              code: 'STATIC_FILE_NOT_FOUND',
-              property: err.path,
-            })
-          )
-        } else {
-          next(new errors.InternalServerError({ err: err }))
+          Key: key,
         }
+        if (req.headers.range) {
+          params.Range = req.headers.range
+        }
+        const out = await this.client.send(new GetObjectCommand(params))
+        const headers: Record<string, string> = {
+          'Cache-Control': 'public, max-age=31536000, immutable',
+          'Content-Type': out.ContentType || getContentType(key),
+          'Accept-Ranges': out.AcceptRanges || 'bytes',
+        }
+        if (out.ContentLength !== undefined)
+          headers['Content-Length'] = String(out.ContentLength)
+        if (out.ContentRange) headers['Content-Range'] = out.ContentRange
+        if (out.ETag) headers['ETag'] = out.ETag
+
+        res.status(out.ContentRange ? 206 : 200).set(headers)
+
+        const stream = out.Body as Readable
+        req.on('close', () => {
+          if (stream && typeof stream.destroy === 'function') {
+            stream.destroy()
+          }
+        })
+        stream.pipe(res)
+      } catch (e) {
+        if (isNotFoundError(e)) {
+          res.status(404).end()
+          return
+        }
+        next(e)
       }
     }
   }
 
-  async read(options: ReadOptions = { path: '' }) {
-    let path = (options.path || '').replace(/\/$|\\$/, '')
-
-    // check if path is stored in s3 handled by us
-    if (!path.startsWith(this.host)) {
-      throw new Error(`${path} is not stored in s3`)
+  async read(options: ReadOptions = { path: '' }): Promise<Buffer> {
+    let path = (options.path || '').replace(/\/+$/, '')
+    if (path.startsWith(this.host)) {
+      path = path.substring(this.host.length)
     }
-    path = path.substring(this.host.length)
-
-    const response = await this.s3().getObject({
-      Bucket: this.bucket,
-      Key: stripLeadingSlash(path),
-    })
-    const stream = response.Body as Readable
-
-    return await new Promise<Buffer>((resolve, reject) => {
-      const chunks: Buffer[] = []
-      stream.on('data', (chunk) => chunks.push(chunk))
-      stream.once('end', () => resolve(Buffer.concat(chunks)))
-      stream.once('error', reject)
-    })
+    const key = this.resolveKey(path)
+    try {
+      const out = await this.client.send(
+        new GetObjectCommand({
+          Bucket: this.bucket,
+          Key: key,
+        })
+      )
+      const data = await out.Body?.transformToByteArray()
+      return Buffer.from(data || [])
+    } catch (err: any) {
+      if (isNotFoundError(err)) {
+        err.errorType = 'NotFoundError'
+        err.statusCode = 404
+      }
+      throw err
+    }
   }
 }
 
-export default S3Storage
+module.exports = S3Storage
